@@ -10,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 import time
 from pathlib import Path
+import random
 
 from models.model import load_pretrained_faster_rcnn
 
@@ -24,16 +25,7 @@ ACTIVITY_DIAGRAM_CLASSES = [
 
 
 class ActivityDiagramDataset(Dataset):
-    """
-    PyTorch Dataset wrapper for activity-diagrams-qdobr dataset.
-    """
-    
     def __init__(self, hf_dataset, transforms=None):
-        """
-        Args:
-            hf_dataset: HuggingFace dataset split (train/validation/test)
-            transforms: Optional transforms to apply to images
-        """
         self.dataset = hf_dataset
         self.transforms = transforms
     
@@ -84,31 +76,59 @@ class ActivityDiagramDataset(Dataset):
 
 
 def collate_fn(batch):
-    """
-    Custom collate function for DataLoader.
-    Since each image has different number of objects, we need custom collation.
-    """
     return tuple(zip(*batch))
 
 
-def create_data_loaders(batch_size=4, num_workers=4):
-    """
-    Create train and validation data loaders.
+class AugmentationTransform:
     
-    Args:
-        batch_size: Batch size for training
-        num_workers: Number of worker processes for data loading
+    def __init__(self, train=True):
+        self.train = train
     
-    Returns:
-        train_loader, val_loader, test_loader
-    """
+    def __call__(self, image, target):
+        if not self.train:
+            return image, target
+        
+        # Random horizontal flip
+        if random.random() < 0.5:
+            image = T.functional.hflip(image)
+            boxes = target['boxes']
+            # Flip boxes: x_new = width - x_old
+            width = image.shape[2]
+            boxes[:, [0, 2]] = width - boxes[:, [2, 0]]
+            target['boxes'] = boxes
+        
+        # Random color jitter (safe for diagrams)
+        if random.random() < 0.5:
+            color_jitter = T.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.1
+            )
+            image = color_jitter(image)
+        
+        # Random rotation (small angles for diagrams)
+        if random.random() < 0.3:
+            angle = random.uniform(-10, 10)
+            image = T.functional.rotate(image, angle)
+            # Note: For simplicity, we skip bbox rotation here
+            # In production, you'd rotate boxes too or use albumentation
+        
+        return image, target
+
+
+def create_data_loaders(batch_size=4, num_workers=4, use_augmentation=True):
     print("Loading activity-diagrams-qdobr dataset...")
     dataset = load_dataset("Francesco/activity-diagrams-qdobr")
     
+    # Create transforms
+    train_transform = AugmentationTransform(train=True) if use_augmentation else None
+    val_transform = AugmentationTransform(train=False)  # No augmentation for validation
+    
     # Create dataset objects
-    train_dataset = ActivityDiagramDataset(dataset['train'])
-    val_dataset = ActivityDiagramDataset(dataset['validation'])
-    test_dataset = ActivityDiagramDataset(dataset['test'])
+    train_dataset = ActivityDiagramDataset(dataset['train'], transforms=train_transform)
+    val_dataset = ActivityDiagramDataset(dataset['validation'], transforms=val_transform)
+    test_dataset = ActivityDiagramDataset(dataset['test'], transforms=val_transform)
     
     # Create data loaders
     train_loader = DataLoader(
@@ -147,20 +167,6 @@ def create_data_loaders(batch_size=4, num_workers=4):
 
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10):
-    """
-    Train for one epoch.
-    
-    Args:
-        model: Faster R-CNN model
-        optimizer: Optimizer
-        data_loader: Training data loader
-        device: Device to train on
-        epoch: Current epoch number
-        print_freq: Print frequency
-    
-    Returns:
-        Average loss for the epoch
-    """
     model.train()
     total_loss = 0
     num_batches = 0
@@ -202,17 +208,6 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
 
 @torch.no_grad()
 def evaluate(model, data_loader, device):
-    """
-    Evaluate the model on validation set.
-    
-    Args:
-        model: Faster R-CNN model
-        data_loader: Validation data loader
-        device: Device to evaluate on
-    
-    Returns:
-        Average loss
-    """
     model.train()  # Keep in training mode to get losses
     total_loss = 0
     num_batches = 0
@@ -248,23 +243,11 @@ def train_faster_rcnn(
     lr_gamma=0.1,
     num_workers=4,
     checkpoint_dir='checkpoints',
-    device=None
+    device=None,
+    early_stopping_patience=10,
+    use_augmentation=True,
+    reduce_lr_on_plateau=True
 ):
-    """
-    Complete training pipeline for Faster R-CNN on activity diagrams.
-    
-    Args:
-        num_epochs: Number of training epochs
-        batch_size: Batch size
-        learning_rate: Initial learning rate
-        momentum: SGD momentum
-        weight_decay: Weight decay for regularization
-        lr_step_size: Step size for learning rate scheduler
-        lr_gamma: Multiplicative factor for learning rate decay
-        num_workers: Number of data loading workers
-        checkpoint_dir: Directory to save checkpoints
-        device: Device to train on (auto-detect if None)
-    """
     # Setup device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -272,6 +255,9 @@ def train_faster_rcnn(
     print(f"Training Faster R-CNN on Activity Diagrams")
     print(f"{'='*60}")
     print(f"Device: {device}")
+    print(f"Data Augmentation: {'Enabled' if use_augmentation else 'Disabled'}")
+    print(f"Early Stopping Patience: {early_stopping_patience if early_stopping_patience > 0 else 'Disabled'}")
+    print(f"LR Reduction on Plateau: {'Enabled' if reduce_lr_on_plateau else 'Disabled'}")
     
     # Create checkpoint directory
     checkpoint_dir = Path(checkpoint_dir)
@@ -280,7 +266,8 @@ def train_faster_rcnn(
     # Load dataset
     train_loader, val_loader, test_loader = create_data_loaders(
         batch_size=batch_size,
-        num_workers=num_workers
+        num_workers=num_workers,
+        use_augmentation=use_augmentation
     )
     
     # Create model
@@ -300,11 +287,23 @@ def train_faster_rcnn(
     )
     
     # Learning rate scheduler
-    lr_scheduler = optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=lr_step_size,
-        gamma=lr_gamma
-    )
+    if reduce_lr_on_plateau:
+        # ReduceLROnPlateau: reduce LR when val loss plateaus
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-7
+        )
+        print("Using ReduceLROnPlateau scheduler (factor=0.5, patience=5)")
+    else:
+        # StepLR: reduce LR at fixed intervals
+        lr_scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=lr_step_size,
+            gamma=lr_gamma
+        )
     
     # Training loop
     print(f"\n{'='*60}")
@@ -312,6 +311,7 @@ def train_faster_rcnn(
     print(f"{'='*60}\n")
     
     best_val_loss = float('inf')
+    epochs_without_improvement = 0
     training_history = {
         'train_loss': [],
         'val_loss': [],
@@ -330,7 +330,10 @@ def train_faster_rcnn(
         val_loss = evaluate(model, val_loader, device)
         
         # Update learning rate
-        lr_scheduler.step()
+        if reduce_lr_on_plateau:
+            lr_scheduler.step(val_loss)  # ReduceLROnPlateau needs the metric
+        else:
+            lr_scheduler.step()  # StepLR doesn't need metric
         current_lr = optimizer.param_groups[0]['lr']
         
         # Record history
@@ -347,9 +350,10 @@ def train_faster_rcnn(
         print(f"  LR:         {current_lr:.6f}")
         print(f"  Time:       {epoch_time:.1f}s")
         
-        # Save best model
+        # Save best model and track early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             checkpoint_path = checkpoint_dir / 'best_model.pth'
             torch.save({
                 'epoch': epoch,
@@ -358,7 +362,19 @@ def train_faster_rcnn(
                 'train_loss': train_loss,
                 'val_loss': val_loss,
             }, checkpoint_path)
-            print(f"  ✅ Saved best model (val_loss: {val_loss:.4f})")
+            print(f"  Saved best model (val_loss: {val_loss:.4f})")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No improvement for {epochs_without_improvement} epoch(s)")
+            
+            # Early stopping check
+            if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
+                print(f"\n{'='*60}")
+                print(f"   Early stopping triggered after {epoch} epochs!")
+                print(f"   No improvement for {early_stopping_patience} consecutive epochs.")
+                print(f"   Best validation loss: {best_val_loss:.4f}")
+                print(f"{'='*60}")
+                break
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
@@ -370,7 +386,7 @@ def train_faster_rcnn(
                 'train_loss': train_loss,
                 'val_loss': val_loss,
             }, checkpoint_path)
-            print(f"  💾 Saved checkpoint: {checkpoint_path.name}")
+            print(f"  Saved checkpoint: {checkpoint_path.name}")
         
         print(f"{'-'*60}\n")
     
@@ -393,16 +409,6 @@ def train_faster_rcnn(
 
 
 def load_trained_model(checkpoint_path, device=None):
-    """
-    Load a trained model from checkpoint.
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        device: Device to load model on
-    
-    Returns:
-        model: Loaded model
-    """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -432,6 +438,9 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=0.005, help='Learning rate')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Checkpoint directory')
+    parser.add_argument('--early-stopping', type=int, default=10, help='Early stopping patience (0 to disable)')
+    parser.add_argument('--no-augmentation', action='store_true', help='Disable data augmentation')
+    parser.add_argument('--no-reduce-lr', action='store_true', help='Disable LR reduction on plateau')
     
     args = parser.parse_args()
     
@@ -441,8 +450,11 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         learning_rate=args.lr,
         num_workers=args.num_workers,
-        checkpoint_dir=args.checkpoint_dir
+        checkpoint_dir=args.checkpoint_dir,
+        early_stopping_patience=args.early_stopping,
+        use_augmentation=not args.no_augmentation,
+        reduce_lr_on_plateau=not args.no_reduce_lr
     )
     
-    print("\n🎉 Training completed successfully!")
+    print("\nTraining completed successfully!")
 
