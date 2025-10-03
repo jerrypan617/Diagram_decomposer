@@ -1,4 +1,4 @@
-# Activity Diagram Object Detection with OCR
+# Diagram Decomposer
 
 Faster R-CNN (Fine-tuned on diagram datas) + Paddle OCR
 
