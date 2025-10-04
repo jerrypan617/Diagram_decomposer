@@ -1,6 +1,6 @@
 # Diagram Decomposer
 
-Faster R-CNN (Fine-tuned on diagram datas) + Paddle OCR
+Faster R-CNN (Fine-tuned on diagram datas: Francesco/activity-diagrams-qdobr) + Paddle OCR
 
 ![Teaser](./teaser.jpg "Teaser.")
 
